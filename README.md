@@ -16,7 +16,7 @@ $ docker run \
 ```
 Example:
 ```sh
-$ docker run -e PACKERFILE=example.jsaon -v ${PWD}:/img --privileged --rm $(docker build -q .)
+$ docker run -e PACKERFILE=example.json -v ${PWD}:/img --privileged --rm $(docker build -q .)
 arm-image output will be in this color.
 
 ==> arm-image: Downloading or copying Image
