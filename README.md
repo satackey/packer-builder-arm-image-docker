@@ -34,4 +34,13 @@ Build 'arm-image' finished.
 --> arm-image: output-arm-image/image
 ```
 
+If you want to cache the download,
+create volume and mount `/root/packer_cache` on it.
+```sh
+$ docker volume create packer_cache
+$ docker run -e PACKERFILE=example.json -v ${PWD}:/img -v packer_cache:/root/packer_cache --privileged --rm $(docker build -q .)
+```
+
+---
+
 See the [upstream repo](https://github.com/solo-io/packer-builder-arm-image) for detailed usage.
