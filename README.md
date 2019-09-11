@@ -1,10 +1,10 @@
-# Packer plugin for ARM images running on Docker
+# Packer plugin for ARM images __running on Docker__
 
 ## Usage
 
-See the [upstream repo](https://github.com/solo-io/packer-builder-arm-image) for detailed usage.
+- See the [upstream repo](https://github.com/solo-io/packer-builder-arm-image) for detailed usage.
 
----
+<!-- ### Running -->
 
 ```bash
 $ docker run \
@@ -19,7 +19,8 @@ $ docker run \
     $(docker build -q .)
 ```
 
-Example:
+### Example
+
 ```bash
 $ docker run -e PACKERFILE=example.json -v ${PWD}:/img --privileged --rm $(docker build -q .)
 arm-image output will be in this color.
@@ -38,7 +39,10 @@ Build 'arm-image' finished.
 ==> Builds finished. The artifacts of successful builds are:
 --> arm-image: output-arm-image/image
 ```
+
 The image is saved with the same name as `$PACKERFILE` without the extension.
+
+### Caching
 
 If you want to cache the download,
 create volume and mount `/root/packer_cache` on it.
