@@ -1,5 +1,5 @@
 # Build source codes
-FROM golang:1.12 AS build-env
+FROM golang:1 AS build-env
 WORKDIR /src
 
 # Install dependencies
@@ -31,7 +31,11 @@ FROM ubuntu:18.04
 RUN apt-get -y update && apt-get -y install \
     binfmt-support \
     kpartx \
-    qemu-user-static
+    qemu-user-static \
+    # Clean up
+    && apt-get autoremove -y \
+    && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=packer-dl /download/packer /usr/local/bin
 COPY --from=build-env /src/packer-builder-arm-image /usr/local/bin
