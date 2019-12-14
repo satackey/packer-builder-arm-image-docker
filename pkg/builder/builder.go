@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	packer_common "github.com/hashicorp/packer/common"
@@ -20,17 +22,23 @@ import (
 
 const BuilderId = "yuval-k.arm-image"
 
-var knownTypes map[utils.KnownImageType][]string
-var knownArgs map[utils.KnownImageType][]string
-
-func init() {
-	knownTypes = make(map[utils.KnownImageType][]string)
-	knownArgs = make(map[utils.KnownImageType][]string)
-	knownTypes[utils.RaspberryPi] = []string{"/boot", "/"}
-	knownTypes[utils.BeagleBone] = []string{"/"}
-	knownTypes[utils.Kali] = []string{"/root", "/"}
-	knownArgs[utils.BeagleBone] = []string{"-cpu", "cortex-a8"}
-}
+var (
+	knownTypes = map[utils.KnownImageType][]string{
+		utils.RaspberryPi: {"/boot", "/"},
+		utils.BeagleBone:  {"/"},
+		utils.Kali:        {"/root", "/"},
+	}
+	knownArgs = map[utils.KnownImageType][]string{
+		utils.BeagleBone: {"-cpu", "cortex-a8"},
+	}
+	defaultChrootTypes = [][]string{
+		{"proc", "proc", "/proc"},
+		{"sysfs", "sysfs", "/sys"},
+		{"bind", "/dev", "/dev"},
+		{"devpts", "devpts", "/dev/pts"},
+		{"binfmt_misc", "binfmt_misc", "/proc/sys/fs/binfmt_misc"},
+	}
+)
 
 type Config struct {
 	packer_common.PackerConfig `mapstructure:",squash"`
@@ -43,20 +51,37 @@ type Config struct {
 	CommandWrapper string `mapstructure:"command_wrapper"`
 
 	// Output directory, where the final image will be stored.
+	// Deprecated - Use OutputFile instead
 	OutputDir string `mapstructure:"output_directory"`
+
+	// Output filename, where the final image will be stored
+	OutputFile string `mapstructure:"output_filename"`
 
 	// Image type. this is used to deduce other settings like image mounts and qemu args.
 	// If not provided, we will try to deduce it from the image url. (see autoDetectType())
+	// For list of valid values, see: pkg/image/utils/images.go
 	ImageType utils.KnownImageType `mapstructure:"image_type"`
 
 	// Where to mounts the image partitions in the chroot.
 	// first entry is the mount point of the first partition. etc..
 	ImageMounts []string `mapstructure:"image_mounts"`
 
+	// The path where the volume will be mounted. This is where the chroot environment will be.
+	// Will be a temporary directory if left unspecified.
+	MountPath string `mapstructure:"mount_path"`
+
 	// What directories mount from the host to the chroot.
-	// leave it empty for reasonable deafults.
+	// leave it empty for reasonable defaults.
 	// array of triplets: [type, device, mntpoint].
 	ChrootMounts [][]string `mapstructure:"chroot_mounts"`
+
+	// What directories mount from the host to the chroot, in addition to the default ones.
+	// Use this instead of `chroot_mounts` if you want to add to the existing defaults instead of
+	// overriding them
+	// array of triplets: [type, device, mntpoint].
+	// for example: `["bind", "/run/systemd", "/run/systemd"]`
+	AdditionalChrootMounts [][]string `mapstructure:"additional_chroot_mounts"`
+
 	// Should the last partition be extended? this only works for the last partition in the
 	// dos partition table, and ext filesystem
 	LastPartitionExtraSize uint64 `mapstructure:"last_partition_extra_size"`
@@ -74,18 +99,12 @@ type Config struct {
 }
 
 type Builder struct {
-	config  Config
-	runner  *multistep.BasicRunner
-	context context.Context
-	cancel  context.CancelFunc
+	config Config
+	runner *multistep.BasicRunner
 }
 
 func NewBuilder() *Builder {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Builder{
-		context: ctx,
-		cancel:  cancel,
-	}
+	return &Builder{}
 }
 
 func (b *Builder) autoDetectType() utils.KnownImageType {
@@ -110,8 +129,13 @@ func (b *Builder) Prepare(cfgs ...interface{}) ([]string, error) {
 	warnings = append(warnings, isoWarnings...)
 	errs = packer.MultiErrorAppend(errs, isoErrs...)
 
-	if b.config.OutputDir == "" {
-		b.config.OutputDir = fmt.Sprintf("output-%s", b.config.PackerConfig.PackerBuildName)
+	if b.config.OutputFile == "" {
+		if b.config.OutputDir != "" {
+			warnings = append(warnings, "output_directory is deprecated, use output_filename instead.")
+			b.config.OutputFile = filepath.Join(b.config.OutputDir, "image")
+		} else {
+			b.config.OutputFile = fmt.Sprintf("output-%s/image", b.config.PackerConfig.PackerBuildName)
+		}
 	}
 
 	if b.config.ChrootMounts == nil {
@@ -119,13 +143,11 @@ func (b *Builder) Prepare(cfgs ...interface{}) ([]string, error) {
 	}
 
 	if len(b.config.ChrootMounts) == 0 {
-		b.config.ChrootMounts = [][]string{
-			{"proc", "proc", "/proc"},
-			{"sysfs", "sysfs", "/sys"},
-			{"bind", "/dev", "/dev"},
-			{"devpts", "devpts", "/dev/pts"},
-			{"binfmt_misc", "binfmt_misc", "/proc/sys/fs/binfmt_misc"},
-		}
+		b.config.ChrootMounts = defaultChrootTypes
+	}
+
+	if len(b.config.AdditionalChrootMounts) > 0 {
+		b.config.ChrootMounts = append(b.config.ChrootMounts, b.config.AdditionalChrootMounts...)
 	}
 
 	if b.config.CommandWrapper == "" {
@@ -183,16 +205,14 @@ type wrappedCommandTemplate struct {
 	Command string
 }
 
-func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
+func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (packer.Artifact, error) {
 
 	wrappedCommand := func(command string) (string, error) {
-		ctx := b.config.ctx
-		ctx.Data = &wrappedCommandTemplate{Command: command}
-		return interpolate.Render(b.config.CommandWrapper, &ctx)
+		b.config.ctx.Data = &wrappedCommandTemplate{Command: command}
+		return interpolate.Render(b.config.CommandWrapper, &b.config.ctx)
 	}
 
 	state := new(multistep.BasicStateBag)
-	state.Put("cache", cache)
 	state.Put("config", &b.config)
 	state.Put("debug", b.config.PackerDebug)
 	state.Put("hook", hook)
@@ -212,7 +232,7 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 		&stepCopyImage{FromKey: "iso_path", ResultKey: "imagefile", ImageOpener: image.NewImageOpener(ui)},
 	}
 
-	if b.config.LastPartitionExtraSize > 0 {
+	if b.config.LastPartitionExtraSize > 0 || b.config.TargetImageSize > 0 {
 		steps = append(steps,
 			&stepResizeLastPart{FromKey: "imagefile"},
 		)
@@ -221,37 +241,33 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	steps = append(steps,
 		&stepMapImage{ImageKey: "imagefile", ResultKey: "partitions"},
 	)
-	if b.config.LastPartitionExtraSize > 0 {
+	if b.config.LastPartitionExtraSize > 0 || b.config.TargetImageSize > 0 {
 		steps = append(steps,
 			&stepResizeFs{PartitionsKey: "partitions"},
 		)
 	}
 
 	steps = append(steps,
-		&stepMountImage{PartitionsKey: "partitions", ResultKey: "mount_path"},
+		&stepMountImage{PartitionsKey: "partitions", ResultKey: "mount_path", MountPath: b.config.MountPath},
 		&StepMountExtra{ChrootKey: "mount_path"},
-		&stepQemuUserStatic{ChrootKey: "mount_path", PathToQemuInChrootKey: "qemuInChroot", Args: Args{Args: b.config.QemuArgs}},
-		&stepRegisterBinFmt{QemuPathKey: "qemuInChroot"},
+	)
+
+	native := runtime.GOARCH == "arm" || runtime.GOARCH == "arm64"
+	if !native {
+		steps = append(steps,
+			&stepQemuUserStatic{ChrootKey: "mount_path", PathToQemuInChrootKey: "qemuInChroot", Args: Args{Args: b.config.QemuArgs}},
+			&stepRegisterBinFmt{QemuPathKey: "qemuInChroot"},
+		)
+	}
+
+	steps = append(steps,
 		&StepChrootProvision{ChrootKey: "mount_path"},
 	)
 
 	b.runner = &multistep.BasicRunner{Steps: steps}
 
-	done := make(chan struct{})
-
-	go func() {
-		select {
-		case <-done:
-			return
-		case <-b.context.Done():
-			b.runner.Cancel()
-			hook.Cancel()
-		}
-	}()
-
 	// Executes the steps
-	b.runner.Run(state)
-	close(done)
+	b.runner.Run(ctx, state)
 
 	if rawErr, ok := state.GetOk("error"); ok {
 		return nil, rawErr.(error)
@@ -264,12 +280,6 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	}
 
 	return &Artifact{image: state.Get("imagefile").(string)}, nil
-}
-
-func (b *Builder) Cancel() {
-	if b.runner != nil {
-		b.cancel()
-	}
 }
 
 type Artifact struct {
