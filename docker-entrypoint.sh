@@ -1,4 +1,5 @@
 #!/bin/sh
+set -ex
 
 # Start binfmt (for kpartx)
 /etc/init.d/binfmt-support start > /dev/null
